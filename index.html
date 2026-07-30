@@ -18,6 +18,9 @@
   header h1 { font-size: 16px; font-weight:600; }
   #status { font-size: 12px; color:#8ea3bd; }
   #refreshBtn { background:#1e3a5f; color:#e6edf3; border:none; padding:8px 12px; border-radius:8px; font-size:13px; }
+  #locationHelp { display:none; padding: 16px; text-align:center; }
+  #locationHelp p { color:#8ea3bd; font-size:13.5px; margin-bottom:12px; line-height:1.5; }
+  #retryLocationBtn { background:#1e3a5f; color:#e6edf3; border:none; padding:10px 18px; border-radius:8px; font-size:14px; }
   #list { padding: 8px 12px 80px; overflow-y:auto; }
   .flight-card { background:#111c2e; border:1px solid #1e2a3f; border-radius:10px; padding:12px; margin-bottom:8px; }
   .flight-card .top { display:flex; justify-content:space-between; align-items:baseline; }
@@ -37,6 +40,10 @@
   <button id="refreshBtn">Actualizar</button>
 </header>
 <div id="map"></div>
+<div id="locationHelp">
+  <p>Necesitamos tu ubicación para buscar vuelos cercanos. Si el navegador te pidió permiso y lo bloqueaste, habilítalo desde el ícono de candado/ajustes del sitio y vuelve a intentar.</p>
+  <button id="retryLocationBtn">Reintentar</button>
+</div>
 <div id="list"><div class="empty">Esperando datos de vuelo...</div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -48,6 +55,9 @@ let userLat = null, userLon = null;
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
+const mapEl = document.getElementById("map");
+const locationHelpEl = document.getElementById("locationHelp");
+const retryLocationBtn = document.getElementById("retryLocationBtn");
 
 function initMap(lat, lon) {
   map = L.map("map").setView([lat, lon], 9);
@@ -88,19 +98,35 @@ async function loadFlights() {
 
 document.getElementById("refreshBtn").addEventListener("click", loadFlights);
 
-navigator.geolocation.getCurrentPosition(
-  (pos) => {
-    userLat = pos.coords.latitude;
-    userLon = pos.coords.longitude;
-    initMap(userLat, userLon);
-    loadFlights();
-    setInterval(loadFlights, 20000); // cada 20s, respeta límites de API anónima
-  },
-  (err) => {
-    statusEl.textContent = "No se pudo obtener ubicación: " + err.message;
-  },
-  { enableHighAccuracy: true }
-);
+function requestLocation() {
+  locationHelpEl.style.display = "none";
+  mapEl.style.display = "";
+  statusEl.textContent = "Obteniendo ubicación...";
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      userLat = pos.coords.latitude;
+      userLon = pos.coords.longitude;
+      initMap(userLat, userLon);
+      loadFlights();
+      setInterval(loadFlights, 20000); // cada 20s, respeta límites de API anónima
+    },
+    (err) => {
+      mapEl.style.display = "none";
+      locationHelpEl.style.display = "block";
+      if (err.code === err.PERMISSION_DENIED) {
+        statusEl.textContent = "Permiso de ubicación denegado.";
+      } else if (err.code === err.POSITION_UNAVAILABLE) {
+        statusEl.textContent = "No se pudo determinar tu ubicación.";
+      } else {
+        statusEl.textContent = "Tiempo de espera agotado buscando tu ubicación.";
+      }
+    },
+    { enableHighAccuracy: true }
+  );
+}
+
+retryLocationBtn.addEventListener("click", requestLocation);
+requestLocation();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
