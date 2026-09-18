@@ -1,4 +1,4 @@
-const CACHE_NAME = "vuelos-cercanos-cache-v3";
+const CACHE_NAME = "vuelos-cercanos-cache-v4";
 const ASSETS = [
   "./", "./index.html", "./app-logic.js",
   "./manifest.json", "./icon-192.png", "./icon-512.png",

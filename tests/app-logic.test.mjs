@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import {
   parseAircraft, fetchNearbyFlights, coarseCoord, fmtAltitude, fmtSpeed,
-  bearingLabel, escapeHtml, haversineKm, PROVIDERS,
+  bearingLabel, escapeHtml, haversineKm, PROVIDERS, CORS_PROXIES, buildAttempts,
 } from "../app-logic.js";
 
 let passed = 0;
@@ -137,11 +137,47 @@ await asyncCheck("si todos fallan lanza error con el detalle de cada intento", a
     await assert.rejects(
       () => fetchNearbyFlights(BOG.lat, BOG.lon),
       (err) => {
-        assert.equal(err.failures.length, PROVIDERS.length);
+        assert.equal(err.failures.length, buildAttempts(0, 0, 100, null).length);
         assert.ok(err.failures[0].startsWith("adsb.lol:"));
+        // El detalle debe incluir los intentos vía reenvío, no solo los directos.
+        assert.ok(err.failures.some((f) => f.includes("vía allorigins")));
         return true;
       });
   });
+});
+
+console.log("\nbuildAttempts (directos + reenvíos CORS)");
+check("prueba primero los directos y luego los reenvíos", () => {
+  const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
+  assert.deepEqual(labels.slice(0, 3), PROVIDERS.map((p) => p.name));
+  assert.equal(labels.length, PROVIDERS.length + CORS_PROXIES.length * 2);
+  assert.ok(labels.slice(3).every((l) => l.includes(" vía ")));
+});
+check("el reenvío lleva la URL del proveedor codificada", () => {
+  const proxied = buildAttempts(4.65, -74.05, 100, null).find((a) => a.label === "adsb.lol vía allorigins");
+  assert.ok(proxied.url.startsWith("https://api.allorigins.win/raw?url="));
+  assert.ok(proxied.url.includes(encodeURIComponent("https://api.adsb.lol/v2/lat/4.65/lon/-74.05/dist/100")));
+});
+check("la fuente recordada se intenta de primeras", () => {
+  const labels = buildAttempts(4.65, -74.05, 100, "adsb.fi vía allorigins").map((a) => a.label);
+  assert.equal(labels[0], "adsb.fi vía allorigins");
+  assert.equal(labels.length, new Set(labels).size, "no debe duplicar intentos");
+});
+check("una fuente recordada que ya no existe no rompe el orden", () => {
+  const labels = buildAttempts(4.65, -74.05, 100, "proveedor-fantasma").map((a) => a.label);
+  assert.equal(labels[0], "adsb.lol");
+});
+
+await asyncCheck("si todos los directos fallan, usa el reenvío CORS", async () => {
+  const tried = [];
+  const res = await withFetch(async (url) => {
+    tried.push(url);
+    if (!url.includes("allorigins")) throw new TypeError("Load failed");
+    return jsonResponse(sample);
+  }, () => fetchNearbyFlights(BOG.lat, BOG.lon));
+  assert.equal(res.provider, "adsb.lol vía allorigins");
+  assert.equal(res.flights.length, 4);
+  assert.equal(tried.length, 4); // 3 directos + el primer reenvío
 });
 
 await asyncCheck("manda el centro redondeado, no la posición exacta", async () => {

@@ -11,20 +11,52 @@ export const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch
 // Proveedores de datos ADS-B. Los tres son públicos, sin llave ni cuenta, y
 // exponen la misma forma de respuesta (formato readsb/tar1090 "v2": un array
 // `ac` de objetos), así que un solo parser sirve para todos.
-//
-// Se reemplazó a OpenSky porque sus respuestas no traen el header
-// Access-Control-Allow-Origin: el servidor responde bien si abres la URL
-// directo, pero el navegador bloquea la lectura desde fetch() y Safari lo
-// reporta como el error genérico "Load failed". Estos tres sí están pensados
-// para consumirse desde el navegador.
 export const PROVIDERS = [
   { name: "adsb.lol", url: (lat, lon, nm) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}` },
   { name: "adsb.fi", url: (lat, lon, nm) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${nm}` },
   { name: "airplanes.live", url: (lat, lon, nm) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}` },
 ];
 
+// Reenvíos CORS públicos, como segundo intento cuando la petición directa
+// no se puede leer. En iPad los cuatro dominios de datos probados (OpenSky y
+// estos tres) fallaron con el mismo "Load failed" de Safari, que es lo que
+// ese navegador reporta tanto si falta el header Access-Control-Allow-Origin
+// como si algo en la red o un bloqueador de contenido corta la petición.
+// Pasar por otro dominio resuelve los dos casos.
+export const CORS_PROXIES = [
+  { name: "allorigins", wrap: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+  { name: "corsproxy", wrap: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}` },
+];
+
 export const DEFAULT_RADIUS_NM = 100; // ~185 km
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 9000;
+
+// Qué fuente funcionó la última vez. Se reintenta esa primero, para no gastar
+// varios intentos fallidos en cada refresco de los que corren cada 20s.
+const MEMORY_KEY = "vuelos-cercanos-fuente";
+export function rememberedSource() {
+  try { return localStorage.getItem(MEMORY_KEY); } catch { return null; }
+}
+function rememberSource(label) {
+  try { localStorage.setItem(MEMORY_KEY, label); } catch { /* modo privado: seguimos igual */ }
+}
+
+// Lista ordenada de intentos: primero las fuentes directas (más rápidas y sin
+// terceros de por medio), después las mismas vía reenvío CORS.
+export function buildAttempts(lat, lon, radiusNm = DEFAULT_RADIUS_NM, remembered = rememberedSource()) {
+  const attempts = PROVIDERS.map((p) => ({ label: p.name, url: p.url(lat, lon, radiusNm) }));
+  for (const proxy of CORS_PROXIES) {
+    for (const provider of PROVIDERS.slice(0, 2)) {
+      attempts.push({
+        label: `${provider.name} vía ${proxy.name}`,
+        url: proxy.wrap(provider.url(lat, lon, radiusNm)),
+      });
+    }
+  }
+  const first = attempts.findIndex((a) => a.label === remembered);
+  if (first > 0) attempts.unshift(attempts.splice(first, 1)[0]);
+  return attempts;
+}
 
 // Silueta de avión en vista superior, con el morro hacia arriba (viewBox
 // 0 0 100 100). Es el mismo símbolo en el encabezado, en los marcadores del
@@ -116,23 +148,25 @@ export function parseAircraft(data, userLat, userLon) {
     .sort((a, b) => a.dist - b.dist);
 }
 
-// Pide los vuelos cercanos, probando los proveedores en orden hasta que uno
-// responda. Si ninguno lo hace, lanza un error con el detalle de cada intento
+// Pide los vuelos cercanos probando cada fuente en orden hasta que una
+// responda. Si ninguna lo hace, lanza un error con el detalle de cada intento
 // (útil para saber si fue CORS, un 429, o la red del usuario).
 export async function fetchNearbyFlights(lat, lon, radiusNm = DEFAULT_RADIUS_NM) {
   const qLat = coarseCoord(lat), qLon = coarseCoord(lon);
   const failures = [];
 
-  for (const provider of PROVIDERS) {
+  for (const attempt of buildAttempts(qLat, qLon, radiusNm)) {
     try {
-      const data = await fetchJson(provider.url(qLat, qLon, radiusNm));
-      return { flights: parseAircraft(data, lat, lon), provider: provider.name };
+      const data = await fetchJson(attempt.url);
+      const flights = parseAircraft(data, lat, lon);
+      rememberSource(attempt.label);
+      return { flights, provider: attempt.label };
     } catch (err) {
-      failures.push(`${provider.name}: ${err && (err.message || err.name)}`);
+      failures.push(`${attempt.label}: ${err && (err.message || err.name)}`);
     }
   }
 
-  const error = new Error("Ningún proveedor de datos respondió");
+  const error = new Error("Ninguna fuente de datos respondió");
   error.failures = failures;
   throw error;
 }
