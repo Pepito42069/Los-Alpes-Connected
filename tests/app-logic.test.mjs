@@ -68,6 +68,40 @@ check("track no numérico no se propaga al DOM", () => {
   assert.equal(parseAircraft(evil, 0, 0)[0].track, 0);
 });
 
+// Registro copiado tal cual de una respuesta real de api.adsb.lol sobre
+// Colombia, con todos sus campos extra. Sirve para verificar que el parser
+// aguanta la forma de producción y no solo los datos de prueba recortados.
+const realRecord = {
+  hex: "0c21a3", type: "adsb_icao", flight: "CMP320  ", r: "HP-9801CMP", t: "B38M",
+  alt_baro: 34000, alt_geom: 36450, gs: 447.4, ias: 258, tas: 446, mach: 0.744,
+  wd: 248, ws: 4, oat: -36, tat: -10, track: 354.10, track_rate: 0.00, roll: -0.35,
+  mag_heading: 0.35, true_heading: 353.49, baro_rate: 0, geom_rate: 32, squawk: "2523",
+  emergency: "none", category: "A3", nav_qnh: 1013.6, nav_altitude_mcp: 34016,
+  nav_altitude_fms: 34000, nav_heading: 0.00, lat: 4.610413, lon: -76.908207,
+  nic: 8, rc: 186, seen_pos: 0.021, version: 2, nic_baro: 1, nac_p: 9, nac_v: 2,
+  sil: 3, sil_type: "perhour", gva: 2, sda: 2, alert: 0, spi: 0, mlat: [], tisb: [],
+  messages: 2510, seen: 0.0, rssi: -18.2, dst: 87.349, dir: 251.7,
+};
+
+console.log("\nrespuesta real de producción");
+check("procesa un registro real de adsb.lol", () => {
+  const [f] = parseAircraft({ ac: [realRecord] }, 5.07, -75.52);
+  assert.equal(f.callsign, "CMP320");            // se recortan los espacios finales
+  assert.equal(f.icao24, "0c21a3");
+  assert.equal(Math.round(f.altitudeM), 10363);  // 34000 ft
+  assert.equal(Math.round(f.speedKmh), 829);     // 447.4 kt
+  assert.equal(f.track, 354.10);
+  assert.equal(f.onGround, false);
+  assert.equal(fmtAltitude(f), "10363 m");
+  assert.equal(fmtSpeed(f), "829 km/h");
+});
+check("la distancia propia concuerda con la que reporta el proveedor", () => {
+  const [f] = parseAircraft({ ac: [realRecord] }, 5.07, -75.52);
+  const proveedorKm = realRecord.dst * 1.852; // dst viene en millas náuticas
+  assert.ok(Math.abs(f.dist - proveedorKm) < 5,
+    `propia ${f.dist.toFixed(1)} km vs proveedor ${proveedorKm.toFixed(1)} km`);
+});
+
 console.log("\nescapeHtml");
 check("escapa payload XSS en callsign", () => {
   const out = escapeHtml('<img src=x onerror="alert(1)">');
@@ -150,8 +184,21 @@ console.log("\nbuildAttempts (directos + reenvíos CORS)");
 check("prueba primero los directos y luego los reenvíos", () => {
   const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
   assert.deepEqual(labels.slice(0, 3), PROVIDERS.map((p) => p.name));
-  assert.equal(labels.length, PROVIDERS.length + CORS_PROXIES.length * 2);
+  assert.equal(labels.length, PROVIDERS.length + CORS_PROXIES.length + 1);
   assert.ok(labels.slice(3).every((l) => l.includes(" vía ")));
+  assert.equal(labels.length, new Set(labels).size, "no debe haber intentos repetidos");
+});
+check("hay un reenvío por cada proxy sobre la fuente principal", () => {
+  const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
+  for (const proxy of CORS_PROXIES) {
+    assert.ok(labels.includes(`${PROVIDERS[0].name} vía ${proxy.name}`), `falta ${proxy.name}`);
+  }
+});
+check("no todos los reenvíos apuntan a la misma fuente", () => {
+  const proxiedTargets = buildAttempts(4.65, -74.05, 100, null)
+    .filter((a) => a.label.includes(" vía "))
+    .map((a) => a.label.split(" vía ")[0]);
+  assert.ok(new Set(proxiedTargets).size >= 2, "los reenvíos deben cubrir más de una fuente");
 });
 check("el reenvío lleva la URL del proveedor codificada", () => {
   const proxied = buildAttempts(4.65, -74.05, 100, null).find((a) => a.label === "adsb.lol vía allorigins");

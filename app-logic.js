@@ -25,6 +25,7 @@ export const PROVIDERS = [
 // Pasar por otro dominio resuelve los dos casos.
 export const CORS_PROXIES = [
   { name: "allorigins", wrap: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+  { name: "codetabs", wrap: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
   { name: "corsproxy", wrap: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}` },
 ];
 
@@ -42,17 +43,23 @@ function rememberSource(label) {
 }
 
 // Lista ordenada de intentos: primero las fuentes directas (más rápidas y sin
-// terceros de por medio), después las mismas vía reenvío CORS.
+// terceros de por medio; además funcionan en navegadores o redes donde el
+// bloqueo CORS no aplique), después las mismas vía reenvío.
+//
+// Los reenvíos se concentran en PROVIDERS[0], que es la fuente que
+// verificamos que responde con datos completos, y se agrega uno sobre la
+// segunda por diversidad: si adsb.lol se cae, no quedan todos los reenvíos
+// apuntando al mismo lugar.
 export function buildAttempts(lat, lon, radiusNm = DEFAULT_RADIUS_NM, remembered = rememberedSource()) {
   const attempts = PROVIDERS.map((p) => ({ label: p.name, url: p.url(lat, lon, radiusNm) }));
-  for (const proxy of CORS_PROXIES) {
-    for (const provider of PROVIDERS.slice(0, 2)) {
-      attempts.push({
-        label: `${provider.name} vía ${proxy.name}`,
-        url: proxy.wrap(provider.url(lat, lon, radiusNm)),
-      });
-    }
-  }
+
+  const proxied = (provider, proxy) => ({
+    label: `${provider.name} vía ${proxy.name}`,
+    url: proxy.wrap(provider.url(lat, lon, radiusNm)),
+  });
+  for (const proxy of CORS_PROXIES) attempts.push(proxied(PROVIDERS[0], proxy));
+  attempts.push(proxied(PROVIDERS[1], CORS_PROXIES[0]));
+
   const first = attempts.findIndex((a) => a.label === remembered);
   if (first > 0) attempts.unshift(attempts.splice(first, 1)[0]);
   return attempts;
