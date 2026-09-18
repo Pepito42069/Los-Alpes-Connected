@@ -1,4 +1,4 @@
-const CACHE_NAME = "vuelos-cercanos-cache-v1";
+const CACHE_NAME = "vuelos-cercanos-cache-v2";
 const ASSETS = [
   "./", "./index.html", "./app-logic.js",
   "./manifest.json", "./icon-192.png", "./icon-512.png",
@@ -25,7 +25,7 @@ self.addEventListener("fetch", (event) => {
   const sameOrigin = url.origin === self.location.origin;
 
   // Solo el shell de la app (mismo origen, GET) se cachea. Todo lo demás —
-  // sobre todo las llamadas a la API de OpenSky y los tiles de OpenStreetMap
+  // sobre todo las llamadas a las APIs de datos ADS-B y los tiles de OSM
   // — va directo a la red sin pasar por la caché: son datos en vivo (posición
   // de aviones), y servir una respuesta vieja desde la caché sería peor que
   // no mostrar nada.

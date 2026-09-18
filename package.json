@@ -1,0 +1,8 @@
+{
+  "name": "vuelos-cercanos",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/app-logic.test.mjs"
+  }
+}

@@ -28,6 +28,7 @@
   .flight-card .dist { color:#6fd38a; font-weight:600; font-size:14px; }
   .flight-card .details { color:#8ea3bd; font-size:12.5px; margin-top:4px; display:flex; gap:12px; flex-wrap:wrap;}
   .empty { text-align:center; color:#6b7f99; padding: 24px; font-size:14px; }
+  .empty .diag { display:block; margin-top:10px; color:#55697f; font-size:11.5px; line-height:1.6; }
   .plane-icon { font-size: 18px; }
 </style>
 </head>
@@ -48,10 +49,15 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script type="module">
-import { fetchNearbyFlights, renderFlightList, escapeHtml } from "./app-logic.js";
+import { fetchNearbyFlights, renderFlightList, escapeHtml, fmtAltitude } from "./app-logic.js";
 
-let map, planeMarkers = [];
+// Leaflet se carga desde un CDN. Si la red lo bloquea o el CDN falla, la app
+// sigue sirviendo con la lista de vuelos en vez de romperse entera.
+const hasLeaflet = typeof L !== "undefined";
+
+let map = null, planeMarkers = [];
 let userLat = null, userLon = null;
+let refreshTimer = null, loading = false, lastUpdate = null;
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
@@ -60,6 +66,8 @@ const locationHelpEl = document.getElementById("locationHelp");
 const retryLocationBtn = document.getElementById("retryLocationBtn");
 
 function initMap(lat, lon) {
+  if (!hasLeaflet) { mapEl.style.display = "none"; return; }
+  if (map) { map.setView([lat, lon], 9); return; }
   map = L.map("map").setView([lat, lon], 9);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "© OpenStreetMap contributors"
@@ -68,31 +76,51 @@ function initMap(lat, lon) {
 }
 
 function renderMarkers(flights) {
+  if (!map) return;
   planeMarkers.forEach((m) => map.removeLayer(m));
   planeMarkers = [];
   flights.forEach((f) => {
-    // f.track ya fue normalizado a número en app-logic.js (parseStates),
+    // f.track ya fue normalizado a número en app-logic.js (parseAircraft),
     // así que es seguro interpolarlo en el atributo style.
     const icon = L.divIcon({
       html: `<div class="plane-icon" style="transform: rotate(${f.track}deg)">✈️</div>`,
       className: "", iconSize: [24, 24]
     });
     const marker = L.marker([f.lat, f.lon], { icon }).addTo(map)
-      .bindPopup(`<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${f.altitude ? Math.round(f.altitude) + "m" : ""}`);
+      .bindPopup(`<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${fmtAltitude(f)}`);
     planeMarkers.push(marker);
   });
 }
 
 async function loadFlights() {
-  if (userLat === null) return;
-  statusEl.textContent = "Buscando aviones...";
+  if (userLat === null || loading) return;
+  loading = true;
+  statusEl.textContent = lastUpdate ? "Actualizando..." : "Buscando aviones...";
   try {
-    const flights = await fetchNearbyFlights(userLat, userLon);
-    statusEl.textContent = `${flights.length} vuelos detectados · actualizado ${new Date().toLocaleTimeString()}`;
+    const { flights, provider } = await fetchNearbyFlights(userLat, userLon);
+    lastUpdate = new Date();
+    statusEl.textContent = `${flights.length} vuelos · ${provider} · ${lastUpdate.toLocaleTimeString()}`;
     renderFlightList(listEl, flights);
     renderMarkers(flights);
   } catch (err) {
-    statusEl.textContent = "Error al obtener datos: " + err.message;
+    // Un fallo puntual de red no debe borrar los últimos datos buenos.
+    if (lastUpdate) {
+      statusEl.textContent = `Sin datos nuevos · última actualización ${lastUpdate.toLocaleTimeString()}`;
+    } else {
+      statusEl.textContent = "No se pudieron obtener los datos de vuelo.";
+      // El detalle por proveedor se muestra en pantalla (y no solo en la
+      // consola) porque en iPhone no hay forma cómoda de abrirla. Va escapado
+      // como todo lo demás que entra al DOM.
+      const detalle = (err && err.failures || [])
+        .map((f) => escapeHtml(f)).join("<br>");
+      listEl.innerHTML = '<div class="empty">No hubo respuesta de ningún proveedor de datos. '
+        + 'Revisa tu conexión y toca Actualizar.'
+        + (detalle ? `<span class="diag">${detalle}</span>` : "")
+        + "</div>";
+    }
+    if (err && err.failures) console.warn("Proveedores fallidos:", err.failures);
+  } finally {
+    loading = false;
   }
 }
 
@@ -100,7 +128,7 @@ document.getElementById("refreshBtn").addEventListener("click", loadFlights);
 
 function requestLocation() {
   locationHelpEl.style.display = "none";
-  mapEl.style.display = "";
+  mapEl.style.display = hasLeaflet ? "" : "none";
   statusEl.textContent = "Obteniendo ubicación...";
   navigator.geolocation.getCurrentPosition(
     (pos) => {
@@ -108,7 +136,8 @@ function requestLocation() {
       userLon = pos.coords.longitude;
       initMap(userLat, userLon);
       loadFlights();
-      setInterval(loadFlights, 20000); // cada 20s, respeta límites de API anónima
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = setInterval(loadFlights, 20000); // cada 20s, uso razonable de APIs públicas
     },
     (err) => {
       mapEl.style.display = "none";
