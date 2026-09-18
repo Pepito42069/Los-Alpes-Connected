@@ -5,37 +5,130 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Vuelos Cercanos</title>
 <link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#0b1220">
-<meta name="description" content="Rastreador de vuelos cercanos usando geolocalización y datos en vivo de OpenSky Network.">
+<meta name="theme-color" content="#0a0e11">
+<meta name="description" content="Rastreador de vuelos cercanos usando geolocalización y datos ADS-B en vivo.">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" href="icon-192.png">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <style>
+  /* Paleta de instrumento de cabina: grafito neutro (sin tinte azul-violeta),
+     cian para lo interactivo, verde solo para la distancia. Todo angular:
+     sin esquinas redondeadas en ningún elemento. */
+  :root {
+    --bg:#0a0e11; --panel:#10161a; --panel-hi:#131b21; --line:#232d34;
+    --text:#e6ecf0; --muted:#8496a0; --dim:#5d6e78;
+    --accent:#35c5e8; --ok:#64d98a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, system-ui, sans-serif; background:#0b1220; color:#e6edf3; }
-  #map { height: 45vh; width: 100%; }
-  header { padding: 12px 16px; background:#101a2b; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e2a3f;}
-  header h1 { font-size: 16px; font-weight:600; }
-  #status { font-size: 12px; color:#8ea3bd; }
-  #refreshBtn { background:#1e3a5f; color:#e6edf3; border:none; padding:8px 12px; border-radius:8px; font-size:13px; }
-  #locationHelp { display:none; padding: 16px; text-align:center; }
-  #locationHelp p { color:#8ea3bd; font-size:13.5px; margin-bottom:12px; line-height:1.5; }
-  #retryLocationBtn { background:#1e3a5f; color:#e6edf3; border:none; padding:10px 18px; border-radius:8px; font-size:14px; }
-  #list { padding: 8px 12px 80px; overflow-y:auto; }
-  .flight-card { background:#111c2e; border:1px solid #1e2a3f; border-radius:10px; padding:12px; margin-bottom:8px; }
-  .flight-card .top { display:flex; justify-content:space-between; align-items:baseline; }
-  .flight-card .callsign { font-weight:700; font-size:15px; }
-  .flight-card .dist { color:#6fd38a; font-weight:600; font-size:14px; }
-  .flight-card .details { color:#8ea3bd; font-size:12.5px; margin-top:4px; display:flex; gap:12px; flex-wrap:wrap;}
-  .empty { text-align:center; color:#6b7f99; padding: 24px; font-size:14px; }
-  .plane-icon { font-size: 18px; }
+  body {
+    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display:flex; justify-content:space-between; align-items:center; gap:12px;
+    padding: 13px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .brand { display:flex; align-items:center; gap:10px; min-width:0; }
+  .brand > svg { width:20px; height:20px; flex:none; color: var(--accent); }
+  h1 { font-size: 12.5px; font-weight:700; letter-spacing:.16em; text-transform:uppercase; }
+  #status {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    margin-top:4px; font-variant-numeric: tabular-nums;
+  }
+  #refreshBtn {
+    font-family: var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+    background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 0; padding: 9px 13px; flex:none; cursor:pointer;
+  }
+  #refreshBtn:active { background: var(--accent); color: var(--bg); }
+
+  #map { height: 42vh; width: 100%; background: var(--bg); border-bottom: 1px solid var(--line); }
+
+  #list { padding: 10px 12px 80px; }
+  .flight-card {
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 0; padding: 10px 12px; margin-bottom: 6px;
+  }
+  .flight-card .top { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .flight-card .callsign {
+    font-family: var(--mono); font-weight:700; font-size:14px; letter-spacing:.05em;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .flight-card .callsign .mark { color: var(--accent); margin-right:7px; }
+  .flight-card .dist {
+    font-family: var(--mono); color: var(--ok); font-weight:600; font-size:13px;
+    font-variant-numeric: tabular-nums; flex:none;
+  }
+  .flight-card .details { display:flex; gap:16px; flex-wrap:wrap; margin-top:8px; }
+  .flight-card .k {
+    font-size:9px; letter-spacing:.14em; text-transform:uppercase; color: var(--dim); margin-right:6px;
+  }
+  .flight-card .v {
+    font-family: var(--mono); font-size:12px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+
+  .empty { text-align:center; color: var(--dim); padding: 28px 16px; font-size:13px; line-height:1.6; }
+  .empty .diag {
+    display:block; margin-top:12px; padding-top:12px; border-top:1px solid var(--line);
+    font-family: var(--mono); color:#4d5c66; font-size:11px; line-height:1.7;
+  }
+
+  #locationHelp { display:none; padding: 28px 20px; text-align:center; }
+  #locationHelp p { color: var(--muted); font-size:13px; margin-bottom:16px; line-height:1.6; }
+  #retryLocationBtn {
+    font-family: var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    background: transparent; color: var(--accent); border:1px solid var(--accent);
+    border-radius:0; padding: 11px 20px; cursor:pointer;
+  }
+  #retryLocationBtn:active { background: var(--accent); color: var(--bg); }
+
+  /* Marcadores del mapa: mismo símbolo de avión que el encabezado y el ícono
+     de la app, rotado según el rumbo real de la aeronave. */
+  .plane-icon { color: var(--accent); line-height:0; }
+  .plane-icon svg {
+    width:22px; height:22px; display:block;
+    filter: drop-shadow(0 0 2px rgba(0,0,0,.95));
+  }
+  /* Posición propia: rombo, no círculo — símbolo de "propia nave" de las
+     pantallas tácticas, y encaja con el resto angular de la interfaz. */
+  .me-marker {
+    width:10px; height:10px; margin:2px;
+    border:2px solid var(--accent); background: rgba(53,197,232,.28);
+    transform: rotate(45deg);
+  }
+
+  /* Leaflet viene con fondos claros y esquinas redondeadas por defecto. */
+  .leaflet-container { background: var(--bg); font-family: inherit; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+    background: var(--panel-hi); color: var(--text);
+    border:1px solid var(--line); border-radius:0; box-shadow:none;
+  }
+  .leaflet-popup-content { font-family: var(--mono); font-size:12px; margin:9px 11px; line-height:1.5; }
+  .leaflet-popup-content b { color: var(--accent); letter-spacing:.05em; }
+  .leaflet-container a.leaflet-popup-close-button { color: var(--dim); }
+  .leaflet-control-zoom a {
+    background: var(--panel) !important; color: var(--text) !important;
+    border-color: var(--line) !important; border-radius:0 !important;
+  }
+  .leaflet-control-attribution {
+    background: rgba(10,14,17,.85) !important; color: var(--dim) !important; font-size:9px;
+  }
+  .leaflet-control-attribution a { color: var(--muted) !important; }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <h1>✈️ Vuelos Cercanos</h1>
-    <div id="status">Obteniendo ubicación...</div>
+  <div class="brand">
+    <svg viewBox="0 0 100 100" fill="currentColor" aria-hidden="true">
+      <path d="M50 4 L54 14 L54 40 L90 62 L90 70 L54 60 L54 78 L62 86 L62 92 L50 88 L38 92 L38 86 L46 78 L46 60 L10 70 L10 62 L46 40 L46 14 Z"/>
+    </svg>
+    <div>
+      <h1>Vuelos Cercanos</h1>
+      <div id="status">Obteniendo ubicación...</div>
+    </div>
   </div>
   <button id="refreshBtn">Actualizar</button>
 </header>
@@ -48,10 +141,17 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script type="module">
-import { fetchNearbyFlights, renderFlightList, escapeHtml } from "./app-logic.js";
+import { fetchNearbyFlights, renderFlightList, escapeHtml, fmtAltitude, PLANE_PATH } from "./app-logic.js";
 
-let map, planeMarkers = [];
+// Leaflet se carga desde un CDN. Si la red lo bloquea o el CDN falla, la app
+// sigue sirviendo con la lista de vuelos en vez de romperse entera.
+const hasLeaflet = typeof L !== "undefined";
+
+const PLANE_SVG = `<svg viewBox="0 0 100 100" fill="currentColor"><path d="${PLANE_PATH}"/></svg>`;
+
+let map = null, planeMarkers = [];
 let userLat = null, userLon = null;
+let refreshTimer = null, loading = false, lastUpdate = null;
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
@@ -60,39 +160,62 @@ const locationHelpEl = document.getElementById("locationHelp");
 const retryLocationBtn = document.getElementById("retryLocationBtn");
 
 function initMap(lat, lon) {
+  if (!hasLeaflet) { mapEl.style.display = "none"; return; }
+  if (map) { map.setView([lat, lon], 9); return; }
   map = L.map("map").setView([lat, lon], 9);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "© OpenStreetMap contributors"
   }).addTo(map);
-  L.circleMarker([lat, lon], { radius: 7, color: "#3b82f6", fillColor: "#3b82f6", fillOpacity: 0.8 }).addTo(map);
+  const meIcon = L.divIcon({ html: '<div class="me-marker"></div>', className: "", iconSize: [14, 14] });
+  L.marker([lat, lon], { icon: meIcon, interactive: false, zIndexOffset: -100 }).addTo(map);
 }
 
 function renderMarkers(flights) {
+  if (!map) return;
   planeMarkers.forEach((m) => map.removeLayer(m));
   planeMarkers = [];
   flights.forEach((f) => {
-    // f.track ya fue normalizado a número en app-logic.js (parseStates),
+    // f.track ya fue normalizado a número en app-logic.js (parseAircraft),
     // así que es seguro interpolarlo en el atributo style.
     const icon = L.divIcon({
-      html: `<div class="plane-icon" style="transform: rotate(${f.track}deg)">✈️</div>`,
-      className: "", iconSize: [24, 24]
+      html: `<div class="plane-icon" style="transform: rotate(${f.track}deg)">${PLANE_SVG}</div>`,
+      className: "", iconSize: [22, 22]
     });
     const marker = L.marker([f.lat, f.lon], { icon }).addTo(map)
-      .bindPopup(`<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${f.altitude ? Math.round(f.altitude) + "m" : ""}`);
+      .bindPopup(`<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${fmtAltitude(f)}`);
     planeMarkers.push(marker);
   });
 }
 
 async function loadFlights() {
-  if (userLat === null) return;
-  statusEl.textContent = "Buscando aviones...";
+  if (userLat === null || loading) return;
+  loading = true;
+  statusEl.textContent = lastUpdate ? "Actualizando..." : "Buscando aviones...";
   try {
-    const flights = await fetchNearbyFlights(userLat, userLon);
-    statusEl.textContent = `${flights.length} vuelos detectados · actualizado ${new Date().toLocaleTimeString()}`;
+    const { flights, provider } = await fetchNearbyFlights(userLat, userLon);
+    lastUpdate = new Date();
+    statusEl.textContent = `${flights.length} vuelos · ${provider} · ${lastUpdate.toLocaleTimeString()}`;
     renderFlightList(listEl, flights);
     renderMarkers(flights);
   } catch (err) {
-    statusEl.textContent = "Error al obtener datos: " + err.message;
+    // Un fallo puntual de red no debe borrar los últimos datos buenos.
+    if (lastUpdate) {
+      statusEl.textContent = `Sin datos nuevos · última actualización ${lastUpdate.toLocaleTimeString()}`;
+    } else {
+      statusEl.textContent = "No se pudieron obtener los datos de vuelo.";
+      // El detalle por proveedor se muestra en pantalla (y no solo en la
+      // consola) porque en iPhone no hay forma cómoda de abrirla. Va escapado
+      // como todo lo demás que entra al DOM.
+      const detalle = (err && err.failures || [])
+        .map((f) => escapeHtml(f)).join("<br>");
+      listEl.innerHTML = '<div class="empty">No hubo respuesta de ningún proveedor de datos. '
+        + 'Revisa tu conexión y toca Actualizar.'
+        + (detalle ? `<span class="diag">${detalle}</span>` : "")
+        + "</div>";
+    }
+    if (err && err.failures) console.warn("Proveedores fallidos:", err.failures);
+  } finally {
+    loading = false;
   }
 }
 
@@ -100,7 +223,7 @@ document.getElementById("refreshBtn").addEventListener("click", loadFlights);
 
 function requestLocation() {
   locationHelpEl.style.display = "none";
-  mapEl.style.display = "";
+  mapEl.style.display = hasLeaflet ? "" : "none";
   statusEl.textContent = "Obteniendo ubicación...";
   navigator.geolocation.getCurrentPosition(
     (pos) => {
@@ -108,7 +231,8 @@ function requestLocation() {
       userLon = pos.coords.longitude;
       initMap(userLat, userLon);
       loadFlights();
-      setInterval(loadFlights, 20000); // cada 20s, respeta límites de API anónima
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = setInterval(loadFlights, 20000); // cada 20s, uso razonable de APIs públicas
     },
     (err) => {
       mapEl.style.display = "none";
