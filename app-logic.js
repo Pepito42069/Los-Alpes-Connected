@@ -26,6 +26,12 @@ export const PROVIDERS = [
 export const DEFAULT_RADIUS_NM = 100; // ~185 km
 const FETCH_TIMEOUT_MS = 12000;
 
+// Silueta de avión en vista superior, con el morro hacia arriba (viewBox
+// 0 0 100 100). Es el mismo símbolo en el encabezado, en los marcadores del
+// mapa (rotado según el rumbo) y en los íconos de la app, para que la
+// identidad visual sea una sola.
+export const PLANE_PATH = "M50 4 L54 14 L54 40 L90 62 L90 70 L54 60 L54 78 L62 86 L62 92 L50 88 L38 92 L38 86 L46 78 L46 60 L10 70 L10 62 L46 40 L46 14 Z";
+
 const FEET_TO_M = 0.3048;
 const KNOTS_TO_KMH = 1.852;
 
@@ -150,13 +156,13 @@ export function renderFlightList(container, flights, maxItems = 30) {
   container.innerHTML = flights.slice(0, maxItems).map((f) => `
     <div class="flight-card">
       <div class="top">
-        <span class="callsign">✈ ${escapeHtml(f.callsign)}</span>
+        <span class="callsign"><span class="mark">✈</span>${escapeHtml(f.callsign)}</span>
         <span class="dist">${f.dist.toFixed(1)} km</span>
       </div>
       <div class="details">
-        <span>Alt: ${fmtAltitude(f)}</span>
-        <span>Vel: ${fmtSpeed(f)}</span>
-        <span>Dirección: ${bearingLabel(f.brg)}</span>
+        <span><span class="k">Alt</span><span class="v">${fmtAltitude(f)}</span></span>
+        <span><span class="k">Vel</span><span class="v">${fmtSpeed(f)}</span></span>
+        <span><span class="k">Rumbo</span><span class="v">${bearingLabel(f.brg)}</span></span>
       </div>
     </div>
   `).join("");
