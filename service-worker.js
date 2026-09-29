@@ -1,4 +1,4 @@
-const CACHE_NAME = "vuelos-cercanos-cache-v6";
+const CACHE_NAME = "vuelos-cercanos-cache-v7";
 const ASSETS = [
   "./", "./index.html", "./app-logic.js",
   "./manifest.json", "./icon-192.png", "./icon-512.png",
@@ -31,18 +31,26 @@ self.addEventListener("fetch", (event) => {
   // no mostrar nada.
   if (!sameOrigin || event.request.method !== "GET") return;
 
-  // Network-first, con la caché como respaldo solo si falla la red (offline).
-  // Así el shell se actualiza solo con cada visita en línea, en vez de
-  // quedarse pegado en la versión cacheada la primera vez que se instaló.
+  // Cache-first con revalidación en segundo plano. Antes era network-first, lo
+  // que obligaba a esperar la ida y vuelta por el HTML y el JS en cada
+  // apertura, incluso con la copia ya guardada. Ahora el shell se pinta al
+  // instante desde la caché mientras la versión nueva se descarga aparte y
+  // queda lista para la siguiente apertura.
+  //
+  // Esto no afecta a los datos de vuelo: son de otro origen y ni siquiera
+  // entran aquí.
   event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        const copy = response.clone();
-        caches.open(CACHE_NAME)
-          .then((cache) => cache.put(event.request, copy))
-          .catch(() => { /* cuota llena o respuesta no almacenable: no afecta a la app */ });
-        return response;
-      })
-      .catch(() => caches.match(event.request))
+    caches.match(event.request).then((cached) => {
+      const enRed = fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME)
+            .then((cache) => cache.put(event.request, copy))
+            .catch(() => { /* cuota llena o respuesta no almacenable: no afecta a la app */ });
+          return response;
+        })
+        .catch(() => cached);
+      return cached || enRed;
+    })
   );
 });

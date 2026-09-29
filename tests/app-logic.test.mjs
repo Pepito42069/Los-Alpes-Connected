@@ -4,7 +4,17 @@ import assert from "node:assert/strict";
 import {
   parseAircraft, fetchNearbyFlights, coarseCoord, fmtAltitude, fmtSpeed,
   bearingLabel, escapeHtml, haversineKm, PROVIDERS, CORS_PROXIES, buildAttempts, OWN_RELAY,
+  savePosition, lastKnownPosition, movedEnough,
 } from "../app-logic.js";
+
+// localStorage no existe en Node; se simula para probar la memoria de posición.
+const almacen = new Map();
+globalThis.localStorage = {
+  getItem: (k) => (almacen.has(k) ? almacen.get(k) : null),
+  setItem: (k, v) => almacen.set(k, String(v)),
+  removeItem: (k) => almacen.delete(k),
+  clear: () => almacen.clear(),
+};
 
 let passed = 0;
 const check = (name, fn) => {
@@ -284,6 +294,32 @@ await asyncCheck("ninguna fuente recibe la posición exacta, solo el centro redo
     assert.ok(!decoded.includes("74.0512345"), `filtra la longitud exacta: ${url}`);
     assert.ok(/4\.65/.test(decoded) && /-74\.05/.test(decoded), `lleva el centro redondeado: ${url}`);
   }
+});
+
+console.log("\nmemoria de posición (arranque instantáneo)");
+check("guarda y recupera la última posición", () => {
+  almacen.clear();
+  assert.equal(lastKnownPosition(), null, "sin nada guardado debe devolver null");
+  savePosition(5.07, -75.52);
+  assert.deepEqual(lastKnownPosition(), { lat: 5.07, lon: -75.52 });
+});
+check("descarta una posición vieja", () => {
+  almacen.clear();
+  savePosition(5.07, -75.52);
+  assert.equal(lastKnownPosition(-1), null, "con edad máxima vencida no debe usarse");
+});
+check("tolera datos corruptos en el almacenamiento", () => {
+  almacen.clear();
+  almacen.set("vuelos-cercanos-posicion", "no es json");
+  assert.equal(lastKnownPosition(), null);
+  almacen.set("vuelos-cercanos-posicion", JSON.stringify({ lat: "x", lon: null, t: Date.now() }));
+  assert.equal(lastKnownPosition(), null);
+});
+check("movedEnough distingue un ajuste del GPS de un viaje real", () => {
+  const casa = { lat: 5.07, lon: -75.52 };
+  assert.equal(movedEnough(null, casa), true, "sin posición previa siempre se pide");
+  assert.equal(movedEnough(casa, { lat: 5.0702, lon: -75.5203 }), false, "30 m no cambian los vuelos cercanos");
+  assert.equal(movedEnough(casa, { lat: 5.20, lon: -75.52 }), true, "14 km sí");
 });
 
 console.log(`\n${passed} pruebas pasaron\n`);

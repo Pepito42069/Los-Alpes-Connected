@@ -6,9 +6,8 @@
 // resultaron poco fiables: allorigins se pone lentísimo, corsproxy empezó a
 // exigir llave de API (HTTP 401) y codetabs se cae.
 //
-// Esta función corre del lado servidor, donde CORS no aplica, prueba los
-// proveedores en orden y devuelve el primero que responda, ya con los headers
-// correctos para la app.
+// Esta función corre del lado servidor, donde CORS no aplica, y devuelve la
+// respuesta con los headers correctos para la app.
 //
 // No es un proxy abierto: solo acepta lat/lon/dist y solo consulta los tres
 // hosts de la lista de abajo, así que no sirve para alcanzar ningún otro
@@ -27,7 +26,14 @@ const UPSTREAMS = [
   { name: "airplanes.live", url: (lat: number, lon: number, d: number) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${d}` },
 ];
 
-const UPSTREAM_TIMEOUT_MS = 8000;
+const UPSTREAM_TIMEOUT_MS = 6000;
+// Si el proveedor principal no contestó en este tiempo, se lanzan los otros
+// dos en paralelo y gana el primero que responda. En el caso normal (el
+// principal contesta rápido) los otros nunca llegan a salir, así que no se
+// triplica la carga sobre servicios que son gratuitos y comunitarios.
+const HEDGE_MS = 700;
+
+type Aircraft = Record<string, unknown>;
 
 function corsHeaders(origin: string | null): Record<string, string> {
   const allowed = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
@@ -46,15 +52,54 @@ function jsonResponse(body: unknown, status: number, cors: Record<string, string
   });
 }
 
-async function fetchUpstream(url: string): Promise<unknown> {
+// Los proveedores devuelven 40+ campos por aeronave (ias, tas, mach, squawk,
+// nav_*, mlat, tisb, rssi...). La app usa ocho. Recortar aquí, en el servidor,
+// baja el payload que viaja al celular alrededor de un 80%.
+function trimAircraft(raw: unknown): Aircraft[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Aircraft[] = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const ac = a as Aircraft;
+    if (typeof ac.lat !== "number" || typeof ac.lon !== "number") continue;
+    out.push({
+      hex: ac.hex, flight: ac.flight, lat: ac.lat, lon: ac.lon,
+      alt_baro: ac.alt_baro, alt_geom: ac.alt_geom, gs: ac.gs, track: ac.track,
+    });
+  }
+  return out;
+}
+
+async function fetchUpstream(url: string, signal: AbortSignal): Promise<unknown> {
+  const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
+  const res = await fetch(url, {
+    signal: AbortSignal.any([signal, timeout]),
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return await res.json();
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Petición con cobertura: sale el principal y, si se demora, los suplentes.
+// Gana el primero que responda y se aborta el resto.
+async function fetchFastest(lat: number, lon: number, dist: number) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const attempt = async (u: typeof UPSTREAMS[number]) => ({
+    source: u.name,
+    data: await fetchUpstream(u.url(lat, lon, dist), controller.signal),
+  });
+
+  const carreras = [
+    attempt(UPSTREAMS[0]),
+    ...UPSTREAMS.slice(1).map((u) => sleep(HEDGE_MS).then(() => attempt(u))),
+  ];
+
   try {
-    const res = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json" } });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return await res.json();
+    return await Promise.any(carreras);
   } finally {
-    clearTimeout(timer);
+    controller.abort(); // corta las que sigan en vuelo
   }
 }
 
@@ -78,15 +123,14 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Parámetros inválidos: se espera lat (-90..90), lon (-180..180), dist (1..250)" }, 400, cors);
   }
 
-  const fallos: string[] = [];
-  for (const upstream of UPSTREAMS) {
-    try {
-      const data = await fetchUpstream(upstream.url(lat, lon, dist));
-      return jsonResponse({ ...(data as object), source: upstream.name }, 200, cors);
-    } catch (err) {
-      fallos.push(`${upstream.name}: ${(err as Error)?.message ?? "error"}`);
-    }
+  try {
+    const { source, data } = await fetchFastest(lat, lon, dist);
+    const ac = trimAircraft((data as { ac?: unknown })?.ac);
+    return jsonResponse({ ac, source, now: Date.now() }, 200, cors);
+  } catch (err) {
+    const fallos = err instanceof AggregateError
+      ? err.errors.map((e: Error, i: number) => `${UPSTREAMS[i]?.name ?? "?"}: ${e?.message ?? "error"}`)
+      : [String((err as Error)?.message ?? err)];
+    return jsonResponse({ error: "Ningún proveedor respondió", failures: fallos }, 502, cors);
   }
-
-  return jsonResponse({ error: "Ningún proveedor respondió", failures: fallos }, 502, cors);
 });
