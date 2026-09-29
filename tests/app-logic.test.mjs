@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import {
   parseAircraft, fetchNearbyFlights, coarseCoord, fmtAltitude, fmtSpeed,
-  bearingLabel, escapeHtml, haversineKm, PROVIDERS, CORS_PROXIES, buildAttempts,
+  bearingLabel, escapeHtml, haversineKm, PROVIDERS, CORS_PROXIES, buildAttempts, OWN_RELAY,
 } from "../app-logic.js";
 
 let passed = 0;
@@ -135,35 +135,57 @@ const asyncCheck = async (name, fn) => {
   catch (e) { console.log("  FAIL-", name, "\n      ", e.message); process.exitCode = 1; }
 };
 
-await asyncCheck("usa el primer proveedor cuando responde", async () => {
+await asyncCheck("usa el intermediario propio de primeras", async () => {
   const calls = [];
-  const res = await withFetch(async (url) => { calls.push(url); return jsonResponse(sample); },
+  const res = await withFetch(async (url) => { calls.push(url); return jsonResponse({ ...sample, source: "adsb.lol" }); },
     () => fetchNearbyFlights(BOG.lat, BOG.lon));
-  assert.equal(res.provider, "adsb.lol");
+  assert.ok(calls[0].includes("/functions/v1/vuelos-proxy"), calls[0]);
   assert.equal(calls.length, 1);
+  assert.equal(res.provider, "adsb.lol vía servidor propio");
+  assert.equal(res.publicRelay, false);
   assert.equal(res.flights.length, 4);
 });
 
-await asyncCheck("cae al segundo proveedor si el primero falla (CORS/red)", async () => {
+await asyncCheck("si el intermediario no dice de dónde sacó los datos, muestra su nombre", async () => {
+  const res = await withFetch(async () => jsonResponse(sample), () => fetchNearbyFlights(BOG.lat, BOG.lon));
+  assert.equal(res.provider, "servidor propio");
+});
+
+await asyncCheck("cae a las fuentes directas si el intermediario falla", async () => {
   const calls = [];
   const res = await withFetch(async (url) => {
     calls.push(url);
     if (calls.length === 1) throw new TypeError("Load failed");
     return jsonResponse(sample);
   }, () => fetchNearbyFlights(BOG.lat, BOG.lon));
-  assert.equal(res.provider, "adsb.fi");
+  assert.equal(res.provider, "adsb.lol");
   assert.equal(calls.length, 2);
 });
 
-await asyncCheck("cae al tercero si los dos primeros dan error HTTP", async () => {
+await asyncCheck("cae al reenvío público solo cuando fallan intermediario y directas", async () => {
   let n = 0;
   const res = await withFetch(async () => {
     n++;
-    if (n <= 2) return { ok: false, status: 429, json: async () => ({}) };
+    if (n <= 4) throw new TypeError("Load failed"); // intermediario + 3 directas
     return jsonResponse(sample);
   }, () => fetchNearbyFlights(BOG.lat, BOG.lon));
-  assert.equal(res.provider, "airplanes.live");
-  assert.equal(n, 3);
+  assert.equal(res.provider, "adsb.lol vía allorigins");
+  assert.equal(res.publicRelay, true);
+  assert.equal(n, 5);
+});
+
+await asyncCheck("un timeout se reporta con el tiempo esperado, no como 'abort'", async () => {
+  await withFetch(async () => {
+    const err = new Error("The operation was aborted.");
+    err.name = "AbortError";
+    throw err;
+  }, async () => {
+    await assert.rejects(() => fetchNearbyFlights(BOG.lat, BOG.lon), (err) => {
+      assert.ok(err.failures.every((f) => /sin respuesta en \d+s/.test(f)), err.failures.join(" | "));
+      assert.ok(!err.failures.some((f) => /abort/i.test(f)));
+      return true;
+    });
+  });
 });
 
 await asyncCheck("si todos fallan lanza error con el detalle de cada intento", async () => {
@@ -172,7 +194,7 @@ await asyncCheck("si todos fallan lanza error con el detalle de cada intento", a
       () => fetchNearbyFlights(BOG.lat, BOG.lon),
       (err) => {
         assert.equal(err.failures.length, buildAttempts(0, 0, 100, null).length);
-        assert.ok(err.failures[0].startsWith("adsb.lol:"));
+        assert.ok(err.failures[0].startsWith("servidor propio:"));
         // El detalle debe incluir los intentos vía reenvío, no solo los directos.
         assert.ok(err.failures.some((f) => f.includes("vía allorigins")));
         return true;
@@ -181,12 +203,32 @@ await asyncCheck("si todos fallan lanza error con el detalle de cada intento", a
 });
 
 console.log("\nbuildAttempts (directos + reenvíos CORS)");
-check("prueba primero los directos y luego los reenvíos", () => {
+check("ordena: intermediario propio, luego directos, luego reenvíos", () => {
   const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
-  assert.deepEqual(labels.slice(0, 3), PROVIDERS.map((p) => p.name));
-  assert.equal(labels.length, PROVIDERS.length + CORS_PROXIES.length + 1);
-  assert.ok(labels.slice(3).every((l) => l.includes(" vía ")));
+  assert.equal(labels[0], OWN_RELAY.name);
+  assert.deepEqual(labels.slice(1, 4), PROVIDERS.map((p) => p.name));
+  assert.equal(labels.length, 1 + PROVIDERS.length + CORS_PROXIES.length + 1);
+  assert.ok(labels.slice(4).every((l) => l.includes(" vía ")));
   assert.equal(labels.length, new Set(labels).size, "no debe haber intentos repetidos");
+});
+check("cada intento lleva el tiempo de espera acorde a su tipo", () => {
+  const attempts = buildAttempts(4.65, -74.05, 100, null);
+  const propio = attempts.find((a) => a.own);
+  const directo = attempts.find((a) => !a.own && !a.publicRelay);
+  const reenvio = attempts.find((a) => a.publicRelay);
+  assert.ok(directo.timeoutMs < propio.timeoutMs, "el directo debe esperar menos que el propio");
+  assert.ok(propio.timeoutMs < reenvio.timeoutMs, "el reenvío público debe ser el más paciente");
+  assert.ok(reenvio.timeoutMs >= 20000, "los reenvíos lentos morían antes de responder");
+});
+check("ya no se intenta corsproxy, que pasó a exigir llave", () => {
+  const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
+  assert.ok(!labels.some((l) => l.includes("corsproxy")), labels.join(" | "));
+});
+check("el intermediario propio recibe lat/lon/dist como parámetros", () => {
+  const propio = buildAttempts(4.65, -74.05, 100, null).find((a) => a.own);
+  assert.ok(propio.url.includes("lat=4.65"), propio.url);
+  assert.ok(propio.url.includes("lon=-74.05"), propio.url);
+  assert.ok(propio.url.includes("dist=100"), propio.url);
 });
 check("hay un reenvío por cada proxy sobre la fuente principal", () => {
   const labels = buildAttempts(4.65, -74.05, 100, null).map((a) => a.label);
@@ -212,10 +254,10 @@ check("la fuente recordada se intenta de primeras", () => {
 });
 check("una fuente recordada que ya no existe no rompe el orden", () => {
   const labels = buildAttempts(4.65, -74.05, 100, "proveedor-fantasma").map((a) => a.label);
-  assert.equal(labels[0], "adsb.lol");
+  assert.equal(labels[0], OWN_RELAY.name);
 });
 
-await asyncCheck("si todos los directos fallan, usa el reenvío CORS", async () => {
+await asyncCheck("si todo lo demás falla, usa el reenvío CORS", async () => {
   const tried = [];
   const res = await withFetch(async (url) => {
     tried.push(url);
@@ -224,15 +266,24 @@ await asyncCheck("si todos los directos fallan, usa el reenvío CORS", async () 
   }, () => fetchNearbyFlights(BOG.lat, BOG.lon));
   assert.equal(res.provider, "adsb.lol vía allorigins");
   assert.equal(res.flights.length, 4);
-  assert.equal(tried.length, 4); // 3 directos + el primer reenvío
+  assert.equal(tried.length, 5); // intermediario + 3 directos + el primer reenvío
 });
 
-await asyncCheck("manda el centro redondeado, no la posición exacta", async () => {
-  let url = "";
-  await withFetch(async (u) => { url = u; return jsonResponse(sample); },
-    () => fetchNearbyFlights(4.6534567, -74.0512345));
-  assert.ok(url.includes("/lat/4.65/lon/-74.05/"), url);
-  assert.ok(!url.includes("4.6534567"));
+await asyncCheck("ninguna fuente recibe la posición exacta, solo el centro redondeado", async () => {
+  // Se recorren todos los intentos (haciéndolos fallar) para comprobar que
+  // ninguno —ni el intermediario propio, ni los directos, ni los reenvíos—
+  // lleve las coordenadas sin redondear.
+  const urls = [];
+  await withFetch(async (u) => { urls.push(u); throw new TypeError("Load failed"); }, async () => {
+    await assert.rejects(() => fetchNearbyFlights(4.6534567, -74.0512345));
+  });
+  assert.equal(urls.length, buildAttempts(0, 0, 100, null).length);
+  for (const url of urls) {
+    const decoded = decodeURIComponent(url);
+    assert.ok(!decoded.includes("4.6534567"), `filtra la latitud exacta: ${url}`);
+    assert.ok(!decoded.includes("74.0512345"), `filtra la longitud exacta: ${url}`);
+    assert.ok(/4\.65/.test(decoded) && /-74\.05/.test(decoded), `lleva el centro redondeado: ${url}`);
+  }
 });
 
 console.log(`\n${passed} pruebas pasaron\n`);

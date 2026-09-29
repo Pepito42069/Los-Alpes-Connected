@@ -17,23 +17,39 @@ export const PROVIDERS = [
   { name: "airplanes.live", url: (lat, lon, nm) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}` },
 ];
 
-// Reenvíos CORS públicos, como segundo intento cuando la petición directa
-// no se puede leer. En iPad los cuatro dominios de datos probados (OpenSky y
-// estos tres) fallaron con el mismo "Load failed" de Safari, que es lo que
-// ese navegador reporta tanto si falta el header Access-Control-Allow-Origin
-// como si algo en la red o un bloqueador de contenido corta la petición.
-// Pasar por otro dominio resuelve los dos casos.
+// Intermediario propio: una Edge Function en Supabase que consulta a los
+// proveedores del lado servidor (donde CORS no aplica) y devuelve la respuesta
+// con los headers correctos. Es la fuente principal, porque las directas no se
+// pueden leer desde el navegador y los reenvíos públicos resultaron poco
+// fiables: allorigins se pone lentísimo, corsproxy pasó a exigir llave de API
+// (HTTP 401) y codetabs se cae. El código de la función está en
+// supabase/functions/vuelos-proxy/.
+export const OWN_RELAY = {
+  name: "servidor propio",
+  url: (lat, lon, nm) => `https://kghboxffankmpnoulqwp.supabase.co/functions/v1/vuelos-proxy?lat=${lat}&lon=${lon}&dist=${nm}`,
+};
+
+// Reenvíos CORS públicos, ya solo como último recurso si el intermediario
+// propio no está disponible. Se quitó corsproxy.io: empezó a responder
+// HTTP 401 porque ahora exige llave de API.
 export const CORS_PROXIES = [
   { name: "allorigins", wrap: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
   { name: "codetabs", wrap: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
-  { name: "corsproxy", wrap: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}` },
 ];
 
 export const DEFAULT_RADIUS_NM = 100; // ~185 km
-const FETCH_TIMEOUT_MS = 9000;
+
+// El tiempo de espera depende de por dónde vaya la petición: una fuente
+// directa que va a fallar por CORS lo hace de inmediato, mientras que un
+// reenvío tiene que hacer su propia ida y vuelta al proveedor. Con un único
+// timeout corto, los reenvíos lentos morían con "Fetch is aborted" antes de
+// alcanzar a responder.
+const TIMEOUT_DIRECT_MS = 6000;
+const TIMEOUT_OWN_MS = 15000;
+const TIMEOUT_PUBLIC_MS = 20000;
 
 // Qué fuente funcionó la última vez. Se reintenta esa primero, para no gastar
-// varios intentos fallidos en cada refresco de los que corren cada 20s.
+// varios intentos fallidos en cada refresco.
 const MEMORY_KEY = "vuelos-cercanos-fuente";
 export function rememberedSource() {
   try { return localStorage.getItem(MEMORY_KEY); } catch { return null; }
@@ -42,20 +58,27 @@ function rememberSource(label) {
   try { localStorage.setItem(MEMORY_KEY, label); } catch { /* modo privado: seguimos igual */ }
 }
 
-// Lista ordenada de intentos: primero las fuentes directas (más rápidas y sin
-// terceros de por medio; además funcionan en navegadores o redes donde el
-// bloqueo CORS no aplique), después las mismas vía reenvío.
+// Lista ordenada de intentos:
+//   1. el intermediario propio, que es el único camino que no depende ni de
+//      la política CORS del proveedor ni de un servicio gratuito de terceros;
+//   2. las fuentes directas, por si el navegador o la red sí las permiten
+//      (fallan al instante cuando no, así que cuestan poco);
+//   3. los reenvíos públicos, como último recurso.
 //
-// Los reenvíos se concentran en PROVIDERS[0], que es la fuente que
-// verificamos que responde con datos completos, y se agrega uno sobre la
-// segunda por diversidad: si adsb.lol se cae, no quedan todos los reenvíos
-// apuntando al mismo lugar.
+// Los reenvíos se concentran en PROVIDERS[0], que es la fuente verificada, más
+// uno sobre la segunda: si adsb.lol se cae, no quedan todos apuntando al mismo
+// lugar.
 export function buildAttempts(lat, lon, radiusNm = DEFAULT_RADIUS_NM, remembered = rememberedSource()) {
-  const attempts = PROVIDERS.map((p) => ({ label: p.name, url: p.url(lat, lon, radiusNm) }));
+  const attempts = [
+    { label: OWN_RELAY.name, url: OWN_RELAY.url(lat, lon, radiusNm), timeoutMs: TIMEOUT_OWN_MS, own: true },
+    ...PROVIDERS.map((p) => ({ label: p.name, url: p.url(lat, lon, radiusNm), timeoutMs: TIMEOUT_DIRECT_MS })),
+  ];
 
   const proxied = (provider, proxy) => ({
     label: `${provider.name} vía ${proxy.name}`,
     url: proxy.wrap(provider.url(lat, lon, radiusNm)),
+    timeoutMs: TIMEOUT_PUBLIC_MS,
+    publicRelay: true,
   });
   for (const proxy of CORS_PROXIES) attempts.push(proxied(PROVIDERS[0], proxy));
   attempts.push(proxied(PROVIDERS[1], CORS_PROXIES[0]));
@@ -106,9 +129,9 @@ export function coarseCoord(value) {
   return Math.round(value * 100) / 100;
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
@@ -117,6 +140,13 @@ async function fetchJson(url) {
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
     return await res.json();
+  } catch (err) {
+    // "Fetch is aborted" no le dice nada a nadie; que el diagnóstico en
+    // pantalla diga cuánto se esperó.
+    if (err && (err.name === "AbortError" || /abort/i.test(err.message || ""))) {
+      throw new Error(`sin respuesta en ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -164,10 +194,15 @@ export async function fetchNearbyFlights(lat, lon, radiusNm = DEFAULT_RADIUS_NM)
 
   for (const attempt of buildAttempts(qLat, qLon, radiusNm)) {
     try {
-      const data = await fetchJson(attempt.url);
+      const data = await fetchJson(attempt.url, attempt.timeoutMs);
       const flights = parseAircraft(data, lat, lon);
       rememberSource(attempt.label);
-      return { flights, provider: attempt.label };
+      // El intermediario propio informa cuál proveedor le respondió; se muestra
+      // para que el estado siga diciendo de dónde salieron los datos.
+      const provider = attempt.own && data && typeof data.source === "string"
+        ? `${data.source} vía servidor propio`
+        : attempt.label;
+      return { flights, provider, publicRelay: attempt.publicRelay === true };
     } catch (err) {
       failures.push(`${attempt.label}: ${err && (err.message || err.name)}`);
     }
