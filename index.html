@@ -149,9 +149,22 @@ const hasLeaflet = typeof L !== "undefined";
 
 const PLANE_SVG = `<svg viewBox="0 0 100 100" fill="currentColor"><path d="${PLANE_PATH}"/></svg>`;
 
+// Cuando los datos llegan por un reenvío público gratuito conviene refrescar
+// más despacio: a 20s son ~180 peticiones por hora, suficiente para que esos
+// servicios empiecen a limitar o a responder lento.
+const REFRESH_NORMAL_MS = 20000;
+const REFRESH_RELAY_MS = 60000;
+
 let map = null, planeMarkers = [];
 let userLat = null, userLon = null;
-let refreshTimer = null, loading = false, lastUpdate = null;
+let refreshTimer = null, refreshMs = 0, loading = false, lastUpdate = null;
+
+function scheduleRefresh(ms) {
+  if (refreshTimer && ms === refreshMs) return;
+  refreshMs = ms;
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(loadFlights, ms);
+}
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
@@ -192,11 +205,12 @@ async function loadFlights() {
   loading = true;
   statusEl.textContent = lastUpdate ? "Actualizando..." : "Buscando aviones...";
   try {
-    const { flights, provider } = await fetchNearbyFlights(userLat, userLon);
+    const { flights, provider, publicRelay } = await fetchNearbyFlights(userLat, userLon);
     lastUpdate = new Date();
     statusEl.textContent = `${flights.length} vuelos · ${provider} · ${lastUpdate.toLocaleTimeString()}`;
     renderFlightList(listEl, flights);
     renderMarkers(flights);
+    scheduleRefresh(publicRelay ? REFRESH_RELAY_MS : REFRESH_NORMAL_MS);
   } catch (err) {
     // Un fallo puntual de red no debe borrar los últimos datos buenos.
     if (lastUpdate) {
@@ -231,8 +245,7 @@ function requestLocation() {
       userLon = pos.coords.longitude;
       initMap(userLat, userLon);
       loadFlights();
-      if (refreshTimer) clearInterval(refreshTimer);
-      refreshTimer = setInterval(loadFlights, 20000); // cada 20s, uso razonable de APIs públicas
+      scheduleRefresh(REFRESH_NORMAL_MS);
     },
     (err) => {
       mapEl.style.display = "none";
