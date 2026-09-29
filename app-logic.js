@@ -58,6 +58,34 @@ function rememberSource(label) {
   try { localStorage.setItem(MEMORY_KEY, label); } catch { /* modo privado: seguimos igual */ }
 }
 
+// Última posición conocida. Es lo que permite arrancar mostrando vuelos de
+// inmediato: pedir la ubicación al sistema tarda entre medio segundo y varios
+// segundos, y esperarla antes de tocar la red dejaba la app en blanco todo ese
+// rato. Con la posición guardada se dispara la petición al instante y, cuando
+// llega la ubicación real, solo se vuelve a pedir si te moviste de verdad.
+const POSITION_KEY = "vuelos-cercanos-posicion";
+const POSITION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export function savePosition(lat, lon) {
+  try { localStorage.setItem(POSITION_KEY, JSON.stringify({ lat, lon, t: Date.now() })); } catch { /* modo privado */ }
+}
+
+export function lastKnownPosition(maxAgeMs = POSITION_MAX_AGE_MS) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(POSITION_KEY));
+    if (!raw || typeof raw.lat !== "number" || typeof raw.lon !== "number") return null;
+    if (!Number.isFinite(raw.t) || Date.now() - raw.t > maxAgeMs) return null;
+    return { lat: raw.lat, lon: raw.lon };
+  } catch { return null; }
+}
+
+// Un par de cuadras no cambian qué aviones tienes cerca en un radio de 185 km,
+// así que no vale la pena repetir la petición por un ajuste mínimo del GPS.
+export function movedEnough(from, to, km = 3) {
+  if (!from) return true;
+  return haversineKm(from.lat, from.lon, to.lat, to.lon) > km;
+}
+
 // Lista ordenada de intentos:
 //   1. el intermediario propio, que es el único camino que no depende ni de
 //      la política CORS del proveedor ni de un servicio gratuito de terceros;

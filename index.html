@@ -9,6 +9,12 @@
 <meta name="description" content="Rastreador de vuelos cercanos usando geolocalización y datos ADS-B en vivo.">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" href="icon-192.png">
+<!-- El apretón de manos TCP+TLS con cada dominio cuesta cientos de ms en
+     móvil. Adelantarlo mientras se parsea el HTML lo saca del camino crítico. -->
+<link rel="preconnect" href="https://kghboxffankmpnoulqwp.supabase.co" crossorigin>
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+<link rel="dns-prefetch" href="https://a.tile.openstreetmap.org">
+<link rel="modulepreload" href="app-logic.js">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <style>
   /* Paleta de instrumento de cabina: grafito neutro (sin tinte azul-violeta),
@@ -141,7 +147,10 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script type="module">
-import { fetchNearbyFlights, renderFlightList, escapeHtml, fmtAltitude, PLANE_PATH } from "./app-logic.js";
+import {
+  fetchNearbyFlights, renderFlightList, escapeHtml, fmtAltitude, PLANE_PATH,
+  savePosition, lastKnownPosition, movedEnough,
+} from "./app-logic.js";
 
 // Leaflet se carga desde un CDN. Si la red lo bloquea o el CDN falla, la app
 // sigue sirviendo con la lista de vuelos en vez de romperse entera.
@@ -155,7 +164,13 @@ const PLANE_SVG = `<svg viewBox="0 0 100 100" fill="currentColor"><path d="${PLA
 const REFRESH_NORMAL_MS = 20000;
 const REFRESH_RELAY_MS = 60000;
 
-let map = null, planeMarkers = [];
+// Tope de marcadores dibujados: en una zona concurrida pueden llegar cientos,
+// y cada uno es un nodo del DOM que Safari tiene que mover en cada gesto del
+// mapa. La lista de abajo igual se arma con todos.
+const MAX_MARKERS = 120;
+
+let map = null;
+const markersByKey = new Map();
 let userLat = null, userLon = null;
 let refreshTimer = null, refreshMs = 0, loading = false, lastUpdate = null;
 
@@ -183,21 +198,40 @@ function initMap(lat, lon) {
   L.marker([lat, lon], { icon: meIcon, interactive: false, zIndexOffset: -100 }).addTo(map);
 }
 
+// f.track ya fue normalizado a número en app-logic.js (parseAircraft), así que
+// es seguro interpolarlo en el atributo style.
+const planeIcon = (track) => L.divIcon({
+  html: `<div class="plane-icon" style="transform: rotate(${track}deg)">${PLANE_SVG}</div>`,
+  className: "", iconSize: [22, 22],
+});
+const popupHtml = (f) => `<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${fmtAltitude(f)}`;
+
+// Se actualizan los marcadores que ya existen en vez de borrarlos y volverlos
+// a crear cada 20s: reconstruirlos enteros hacía parpadear el mapa y tiraba a
+// la basura ~120 nodos del DOM en cada refresco.
 function renderMarkers(flights) {
   if (!map) return;
-  planeMarkers.forEach((m) => map.removeLayer(m));
-  planeMarkers = [];
-  flights.forEach((f) => {
-    // f.track ya fue normalizado a número en app-logic.js (parseAircraft),
-    // así que es seguro interpolarlo en el atributo style.
-    const icon = L.divIcon({
-      html: `<div class="plane-icon" style="transform: rotate(${f.track}deg)">${PLANE_SVG}</div>`,
-      className: "", iconSize: [22, 22]
-    });
-    const marker = L.marker([f.lat, f.lon], { icon }).addTo(map)
-      .bindPopup(`<b>${escapeHtml(f.callsign)}</b><br>${f.dist.toFixed(1)} km · ${fmtAltitude(f)}`);
-    planeMarkers.push(marker);
-  });
+  const vivos = new Set();
+
+  for (const f of flights.slice(0, MAX_MARKERS)) {
+    const key = f.icao24 || f.callsign;
+    vivos.add(key);
+    const existente = markersByKey.get(key);
+    if (existente) {
+      existente.setLatLng([f.lat, f.lon]);
+      const el = existente.getElement();
+      if (el && el.firstElementChild) el.firstElementChild.style.transform = `rotate(${f.track}deg)`;
+      existente.setPopupContent(popupHtml(f));
+    } else {
+      const marker = L.marker([f.lat, f.lon], { icon: planeIcon(f.track) })
+        .addTo(map).bindPopup(popupHtml(f));
+      markersByKey.set(key, marker);
+    }
+  }
+
+  for (const [key, marker] of markersByKey) {
+    if (!vivos.has(key)) { map.removeLayer(marker); markersByKey.delete(key); }
+  }
 }
 
 async function loadFlights() {
@@ -238,16 +272,23 @@ document.getElementById("refreshBtn").addEventListener("click", loadFlights);
 function requestLocation() {
   locationHelpEl.style.display = "none";
   mapEl.style.display = hasLeaflet ? "" : "none";
-  statusEl.textContent = "Obteniendo ubicación...";
+  if (userLat === null) statusEl.textContent = "Obteniendo ubicación...";
   navigator.geolocation.getCurrentPosition(
     (pos) => {
+      const previa = userLat === null ? null : { lat: userLat, lon: userLon };
       userLat = pos.coords.latitude;
       userLon = pos.coords.longitude;
+      savePosition(userLat, userLon);
       initMap(userLat, userLon);
-      loadFlights();
+      // Si ya se estaba mostrando la zona correcta desde la posición guardada,
+      // no se repite la petición por un ajuste de unos metros.
+      if (movedEnough(previa, { lat: userLat, lon: userLon })) loadFlights();
       scheduleRefresh(REFRESH_NORMAL_MS);
     },
     (err) => {
+      // Si ya hay datos en pantalla desde la última posición conocida, un
+      // fallo de ubicación no debe borrarlos.
+      if (userLat !== null) return;
       mapEl.style.display = "none";
       locationHelpEl.style.display = "block";
       if (err.code === err.PERMISSION_DENIED) {
@@ -258,8 +299,24 @@ function requestLocation() {
         statusEl.textContent = "Tiempo de espera agotado buscando tu ubicación.";
       }
     },
-    { enableHighAccuracy: true }
+    // Sin GPS de alta precisión: para un radio de 185 km sobra la posición
+    // aproximada, y exigirla exacta le costaba varios segundos al celular
+    // antes de que la app pudiera siquiera empezar a pedir datos. maximumAge
+    // permite reusar una posición que el sistema ya tenía calculada.
+    { enableHighAccuracy: false, maximumAge: 300000, timeout: 12000 }
   );
+}
+
+// Arranque optimista: con la última posición conocida se dispara la petición
+// de vuelos de inmediato, en paralelo con la carga del mapa y con la consulta
+// de ubicación, en vez de esperar a que esta última termine.
+const conocida = lastKnownPosition();
+if (conocida) {
+  userLat = conocida.lat;
+  userLon = conocida.lon;
+  loadFlights();
+  initMap(userLat, userLon);
+  scheduleRefresh(REFRESH_NORMAL_MS);
 }
 
 retryLocationBtn.addEventListener("click", requestLocation);
